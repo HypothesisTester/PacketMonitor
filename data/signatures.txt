@@ -1,0 +1,4 @@
+SELECT * FROM
+<script>
+DROP TABLE
+INSERT INTO
