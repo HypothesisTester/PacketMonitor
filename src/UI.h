@@ -9,6 +9,7 @@
 #include <atomic>
 #include "PacketCapture.h"        // For Packet and FlaggedPacket
 #include "AnomalyDetector.h"      // For Anomaly
+#include "SignatureDetector.h"
 
 class UI {
 public:
