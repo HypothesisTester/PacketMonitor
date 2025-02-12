@@ -88,3 +88,48 @@ You can customize the execution by using command-line options:
 
 - **Exiting:**  
   Press `q` or `Q` at any time to quit the application.
+
+### Running Unit Tests
+
+The project includes unit tests for the anomaly detection, signature detection, and utility functions using Google Test.
+
+1. **Install Google Test**  
+   On Ubuntu, install Google Test and CMake:
+
+  sudo apt-get update
+  sudo apt-get install libgtest-dev cmake
+
+
+Then build Google Test:
+
+  cd /usr/src/gtest
+  sudo cmake CMakeLists.txt
+  sudo make
+  sudo cp lib/*.a /usr/lib
+
+### Building the Tests
+
+1. **Open a Terminal in the tests Folder**  
+Navigate to your tests folder inside your PacketMonitor project:
+
+  cd /path/to/PacketMonitor/tests 
+
+2. **Create a Build Directory and Run CMake:**
+
+  mkdir build && cd build
+  cmake ..
+  make
+
+This will compile the test executables: test_AnomalyDetector, test_SignatureDetector, and test_Utils.
+
+### Running the Tests
+
+Run each test executable individually:
+
+  ./test_AnomalyDetector
+  ./test_SignatureDetector
+  ./test_Utils
+
+Alternatively, if you have configured CTest, run:
+
+  ctest
