@@ -1,0 +1,10 @@
+# Exclude build/config & data from language stats
+Makefile                 linguist-vendored
+CMakeLists.txt           linguist-vendored
+*.cmake                  linguist-vendored
+bin/**                   linguist-generated
+data/**                  linguist-generated
+*.log                    linguist-generated
+
+# Count headers as C++ instead of C
+*.h                      linguist-language=C++
