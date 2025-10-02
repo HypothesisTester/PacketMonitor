@@ -1,0 +1,4 @@
+bin/
+tests/build/
+# Logs and other transient files
+*.log
