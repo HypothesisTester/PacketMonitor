@@ -1,2 +1,0 @@
-[2025-02-12 16:12:57] [INFO] Test log event
-[2025-02-12 16:13:01] [INFO] Test log event
