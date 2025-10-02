@@ -2,9 +2,11 @@
 Makefile                 linguist-vendored
 CMakeLists.txt           linguist-vendored
 *.cmake                  linguist-vendored
+*.make                   linguist-generated
 bin/**                   linguist-generated
 data/**                  linguist-generated
 *.log                    linguist-generated
+tests/build/**           linguist-generated
 
 # Count headers as C++ instead of C
 *.h                      linguist-language=C++
