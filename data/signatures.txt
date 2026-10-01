@@ -1,4 +1,51 @@
-SELECT * FROM
-<script>
-DROP TABLE
-INSERT INTO
+# PacketMonitor payload signatures
+#
+#   <severity> <name> "<content>" [nocase] : <alert message>
+#
+# severity: low, medium or high. In content, |0d 0a| is bytes in hex and
+# \" \\ \| are those characters. nocase matches letters in any case.
+# Matching follows each TCP stream, so content split across packets is found.
+
+# Test content: safe ways to check the tool works.
+high   eicar-test-file      "X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!" : EICAR antivirus test file
+
+# Credentials and data sent without encryption.
+medium http-basic-auth      "|0d 0a|authorization: basic "   nocase : Password sent unencrypted (HTTP Basic auth)
+medium ftp-login            "|0d 0a|PASS "                           : Password sent unencrypted (FTP or POP3)
+low    http-cookie-session  "|0d 0a|cookie: session"         nocase : Session cookie sent unencrypted
+
+# Injection attempts.
+medium sql-union-select     "union select"                  nocase : SQL injection attempt (UNION SELECT)
+medium sql-union-all        "union all select"              nocase : SQL injection attempt (UNION ALL SELECT)
+medium sql-always-true      "' or '1'='1"                   nocase : SQL injection attempt ('1'='1')
+medium sql-comment-bypass   "' or 1=1--"                    nocase : SQL injection attempt (OR 1=1)
+medium sql-drop-table       "drop table "                   nocase : SQL injection attempt (DROP TABLE)
+medium sql-sleep            "or sleep("                     nocase : SQL injection attempt (time-based)
+medium xss-script-tag       "<script>alert("                nocase : Cross-site scripting attempt
+medium xss-encoded          "%3cscript%3e"                  nocase : Cross-site scripting attempt (URL-encoded)
+high   log4shell            "${jndi:"                       nocase : Log4Shell exploit attempt (CVE-2021-44228)
+high   log4shell-encoded    "%24%7bjndi"                    nocase : Log4Shell exploit attempt, URL-encoded
+high   shellshock           "() { :;};"                             : Shellshock exploit attempt (CVE-2014-6271)
+high   shellshock-spaced    "() { :; };"                            : Shellshock exploit attempt (CVE-2014-6271)
+high   spring4shell         "class.module.classloader"      nocase : Spring4Shell exploit attempt (CVE-2022-22965)
+
+# Paths an attacker probes for.
+medium path-traversal       "../../../"                             : Path traversal attempt
+medium path-traversal-enc   "..%2f..%2f"                    nocase : Path traversal attempt (URL-encoded)
+high   etc-passwd           "/etc/passwd"                           : Request for /etc/passwd
+high   etc-shadow           "/etc/shadow"                           : Request for /etc/shadow
+medium env-file             "GET /.env "                            : Probe for a .env secrets file
+medium git-config           "GET /.git/config"                      : Probe for an exposed .git directory
+medium wp-login-probe       "POST /wp-login.php"                    : WordPress login brute-force attempt
+
+# Command execution and malware staging.
+high   php-eval-base64      "eval(base64_decode("           nocase : PHP web shell (eval of base64)
+high   powershell-encoded   "powershell -enc"               nocase : Encoded PowerShell command
+high   powershell-download  "downloadstring("               nocase : PowerShell download cradle
+high   bash-reverse-shell   "/dev/tcp/"                             : Reverse shell (bash /dev/tcp)
+
+# Scanners announcing themselves.
+medium sqlmap-agent         "user-agent: sqlmap"            nocase : sqlmap scanner
+medium nikto-agent          "(nikto/"                       nocase : Nikto web scanner
+medium nmap-nse-agent       "nmap scripting engine"         nocase : Nmap script scan
+medium masscan-agent        "masscan/"                      nocase : masscan scanner
