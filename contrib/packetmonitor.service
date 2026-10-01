@@ -1,0 +1,24 @@
+# Runs PacketMonitor without the dashboard, logging alerts to the journal and
+# to /var/log/packetmonitor/alerts.jsonl.
+#
+#   sudo cp build/packetmonitor /usr/local/bin/
+#   sudo cp contrib/packetmonitor.service /etc/systemd/system/
+#   sudo systemctl enable --now packetmonitor
+#   journalctl -u packetmonitor -f
+[Unit]
+Description=PacketMonitor network alerts
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/packetmonitor --headless --log /var/log/packetmonitor/alerts.jsonl
+LogsDirectory=packetmonitor
+Restart=on-failure
+RestartSec=5
+# Runs as root: capture needs raw sockets, and app names need to read every
+# process's sockets in /proc.
+ProtectHome=read-only
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

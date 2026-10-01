@@ -1,4 +1,9 @@
-bin/
-tests/build/
-# Logs and other transient files
-*.log
+/build*/
+/out/
+*.o
+*.pcap
+*.pcap.apps
+*.jsonl
+.DS_Store
+.vscode/
+.idea/

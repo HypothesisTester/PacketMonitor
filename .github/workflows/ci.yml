@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    name: ${{ matrix.os }}, ${{ matrix.build }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+        build: [release, sanitizers]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install libpcap and GoogleTest
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libpcap-dev libgtest-dev
+
+      - name: Configure
+        run: |
+          if [ "${{ matrix.build }}" = sanitizers ]; then
+            cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DPM_SANITIZE=ON
+          else
+            cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          fi
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Benchmark
+        if: matrix.build == 'release'
+        run: |
+          ./build/packetmonitor --read build/sample.pcap --bench --repeat 20
+          ./build/pm-bench-signatures 256
