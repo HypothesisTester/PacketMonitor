@@ -69,6 +69,8 @@ public:
     uint64_t bytes() const { return bytes_; }
     uint64_t alertCount() const { return alertCount_; }
     size_t flowCount() const { return flows_.size(); }
+    /** Flows dropped early to make room in a full table. */
+    uint64_t evictedFlows() const { return evicted_; }
     /** Every alert raised so far (kept for tests and summaries, capped). */
     const std::deque<Alert>& alerts() const { return alerts_; }
     /** The hostname learned for an address, or empty. */
@@ -77,6 +79,7 @@ public:
 private:
     struct Flow;
     Flow* flowFor(const PacketView& p, const FlowKey& key, bool srcIsA);
+    void makeRoom();
     void initFlow(Flow& f, const PacketView& p, bool srcIsA);
     void handleTcp(Flow& f, const PacketView& p, int dir);
     void handlePayload(Flow& f, const PacketView& p, int dir);
@@ -130,7 +133,7 @@ private:
     std::unordered_map<std::string, Group> apps_, hosts_;
 
     int64_t startUsec_ = 0, nowUsec_ = 0, nextTick_ = 0;
-    uint64_t packets_ = 0, bytes_ = 0, notIp_ = 0, malformed_ = 0, alertCount_ = 0;
+    uint64_t packets_ = 0, bytes_ = 0, notIp_ = 0, malformed_ = 0, alertCount_ = 0, evicted_ = 0;
     std::atomic<uint64_t> kernelDrops_{0}, ringDrops_{0};
     bool finished_ = false;
 

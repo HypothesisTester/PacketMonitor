@@ -33,9 +33,11 @@ using namespace pm;
 namespace {
 
 constexpr const char* kVersion = "2.0.0";
-volatile sig_atomic_t gSignal = 0;
+// Lock-free, so safe to set from a signal handler and read from threads.
+std::atomic<int> gSignal{0};
+static_assert(std::atomic<int>::is_always_lock_free, "signal flag must be lock-free");
 
-void onSignal(int sig) { gSignal = sig; }
+void onSignal(int sig) { gSignal.store(sig); }
 
 struct Options {
     std::string interface, file, filter, signatures, writeFile, logFile;
@@ -154,6 +156,10 @@ bool parseArgs(int argc, char** argv, Options& o, int& exitCode) {
         std::fprintf(stderr, "%s: use either --interface or --read, not both\n", argv[0]);
         return exitCode = 2, false;
     }
+    if (o.repeat > 1 && !o.bench) {
+        std::fprintf(stderr, "%s: --repeat only works with --bench\n", argv[0]);
+        return exitCode = 2, false;
+    }
     if (o.bench && o.file.empty()) {
         std::fprintf(stderr, "%s: --bench needs --read FILE\n", argv[0]);
         return exitCode = 2, false;
@@ -197,10 +203,11 @@ void printSummary(const Engine& e, double seconds, const Options& o, uint64_t ca
     std::printf("PacketMonitor benchmark\n");
     std::printf("  file         %s%s\n", o.file.c_str(), o.repeat > 1 ? (" × " + std::to_string(o.repeat)).c_str() : "");
     std::printf("  packets      %s\n", formatCount(e.packets()).c_str());
-    std::printf("  traffic      %s on the wire, %s captured\n", formatBytes(double(e.bytes())).c_str(),
+    std::printf("  traffic      %s on the wire, of which %s was captured\n", formatBytes(double(e.bytes())).c_str(),
                 formatBytes(double(captured)).c_str());
     std::printf("  time         %.3f s\n", seconds);
-    std::snprintf(line, sizeof line, "%.2f million packets/s, %.1f Gb/s of traffic", pps / 1e6, bps / 1e9);
+    std::snprintf(line, sizeof line, "%.2f million packets/s (%.1f Gb/s on the wire, %.1f Gb/s captured)", pps / 1e6,
+                  bps / 1e9, double(captured) * 8 / seconds / 1e9);
     std::printf("  throughput   %s\n", line);
     std::printf("  alerts       %s\n", formatCount(e.alertCount()).c_str());
 }
@@ -340,30 +347,33 @@ int main(int argc, char** argv) {
 
     const auto started = std::chrono::steady_clock::now();
     std::thread captureThread([&] {
-        if (!cap.run(push, captureError)) stop = true;
-        // Benchmarks can read the file again, shifted in time so it continues.
         int64_t first = 0, last = 0;
+        auto firstPass = [&](int64_t ts, const uint8_t* d, uint32_t c, uint32_t w) {
+            if (!first) first = ts;
+            last = ts;
+            push(ts, d, c, w);
+        };
+        if (!cap.run(firstPass, captureError)) stop = true;
+        // A benchmark can read the file again, shifted in time so it continues.
         for (int i = 1; i < o.repeat && !stop; i++) {
-            if (i == 1) {
-                Capture probe;
-                std::string e;
-                if (!probe.openFile(o.file, e)) break;
-                probe.setReplaySpeed(0);
-                probe.run([&](int64_t ts, const uint8_t*, uint32_t, uint32_t) {
-                    if (!first) first = ts;
-                    last = ts;
-                }, e);
-            }
             const int64_t offset = int64_t(i) * (last - first + 1000000);
             Capture again;
             std::string e;
-            if (!again.openFile(o.file, e)) break;
+            if (!again.openFile(o.file, e) || !again.setFilter(o.filter, e)) break;
             again.setReplaySpeed(0);
-            again.run([&](int64_t ts, const uint8_t* d, uint32_t c, uint32_t w) { push(ts + offset, d, c, w); }, e);
+            again.run(
+                [&](int64_t ts, const uint8_t* d, uint32_t c, uint32_t w) {
+                    if (stop.load(std::memory_order_relaxed)) again.stop();
+                    push(ts + offset, d, c, w);
+                },
+                e);
         }
         captureDone = true;
     });
 
+    // How far behind the clock to close each second, so packets still on
+    // their way through the ring land in the right one.
+    const int64_t lagUsec = int64_t(300000 * std::max(1.0, o.speed));
     std::thread engineThread([&] {
         auto lastStats = std::chrono::steady_clock::now();
         for (;;) {
@@ -373,12 +383,14 @@ int main(int argc, char** argv) {
                 lastStats = now;
                 engine.setCaptureDrops(cap.stats().dropped, ringDrops.load());
                 if (systemOwners) engine.setAppsProblem(systemOwners->problem());
-                int64_t clock = cap.clockUsec();
-                if (clock) engine.advanceTo(clock);
             }
             if (n == 0) {
                 if (captureDone && ring.empty()) break;
                 if (stop) break;
+                // Nothing waiting: let time pass, so a quiet network still
+                // ticks. Only now, so seconds never close ahead of a backlog.
+                int64_t clock = o.bench ? 0 : cap.clockUsec();
+                if (clock) engine.advanceTo(clock - lagUsec);
                 if (o.bench) std::this_thread::yield();
                 else std::this_thread::sleep_for(std::chrono::milliseconds(2));
             }
@@ -390,10 +402,7 @@ int main(int argc, char** argv) {
     // Turns a signal into an orderly stop.
     std::thread watcher([&] {
         while (!engineDone) {
-            if (gSignal) {
-                stop = true;
-                cap.stop();
-            }
+            if (gSignal.load()) stop = true;
             if (stop) cap.stop();
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
@@ -409,7 +418,7 @@ int main(int argc, char** argv) {
         std::atomic<bool> uiStop{false};
         std::thread relay([&] {
             while (!uiStop) {
-                if (gSignal) uiStop = true;
+                if (gSignal.load()) uiStop = true;
                 std::this_thread::sleep_for(std::chrono::milliseconds(50));
             }
         });

@@ -1,6 +1,8 @@
 // macOS: walks every process's file descriptors with libproc (as lsof does)
 // and reads the addresses of its internet sockets.
+#include <arpa/inet.h>
 #include <libproc.h>
+#include <sys/param.h>
 #include <netinet/in.h>
 #include <sys/proc_info.h>
 #include <unistd.h>
@@ -26,7 +28,7 @@ IpAddr fromSockAddr(const in_sockinfo& ini, bool foreign) {
         a.family = 6;
         std::memcpy(a.bytes.data(), &v6, 16);
     }
-    return a;
+    return a.withoutScope();
 }
 
 std::string appName(pid_t pid) {

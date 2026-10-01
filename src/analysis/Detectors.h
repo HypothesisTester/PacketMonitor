@@ -41,6 +41,7 @@ public:
     /** A connection attempt: TCP SYN without ACK. */
     void onAttempt(int64_t tsUsec, const IpAddr& src, const IpAddr& dst, uint16_t dport);
     void tick(int64_t nowUsec, AlertList& out);
+    void reset() { pairs_.clear(); }
     size_t tracked() const { return pairs_.size(); }
 
 private:
@@ -65,6 +66,7 @@ public:
     void onAttempt(int64_t tsUsec, const IpAddr& dst, uint16_t dport);
     void onCompleted(int64_t tsUsec, const IpAddr& dst, uint16_t dport);
     void tick(int64_t nowUsec, AlertList& out);
+    void reset() { targets_.clear(); }
 
 private:
     struct Key {

@@ -42,6 +42,15 @@ struct IpAddr {
     bool isMulticastOrBroadcast() const;
     /** For ::ffff:a.b.c.d, the IPv4 address; otherwise the address itself. */
     IpAddr unmapped() const;
+    /**
+     * Link-local IPv6 without the interface index that BSD stacks (macOS)
+     * keep in bytes 2–3, which packets on the wire never carry.
+     */
+    IpAddr withoutScope() const {
+        IpAddr a = *this;
+        if (family == 6 && bytes[0] == 0xfe && (bytes[1] & 0xc0) == 0x80) a.bytes[2] = a.bytes[3] = 0;
+        return a;
+    }
 
     friend bool operator==(const IpAddr& a, const IpAddr& b) {
         return a.family == b.family && a.bytes == b.bytes;

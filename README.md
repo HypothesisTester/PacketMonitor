@@ -32,21 +32,24 @@ nothing else. Runs on macOS and Linux.
 | --- | --- |
 | Payload signature | One of 32 built-in rules: Log4Shell, Shellshock, Spring4Shell, SQL injection, cross-site scripting, path traversal, web shells, encoded PowerShell, scanners' user agents, passwords sent over plain HTTP, FTP or POP3, and the EICAR test file. |
 | Port scan | One source trying 20 or more ports on one host within 10 seconds. |
-| SYN flood | At least 100 connection attempts a second to one service, with under 20% completing the handshake. |
+| SYN flood | At least 100 connection attempts a second to one service, averaged over 5 seconds, with fewer than 20% completing the handshake. |
 | Traffic spike | Inbound or outbound traffic far above this network's usual level for 3 seconds. |
 
 Signatures are matched with **Aho–Corasick**: every rule is found in one pass
 over the payload. Matching follows each TCP stream in sequence order, skipping
 retransmitted bytes, so a pattern split across two packets is still found,
-and found once. Rules live in [`data/signatures.txt`](data/signatures.txt) and
+and found once. The same rule between the same two addresses alerts at most
+once a minute. Rules live in [`data/signatures.txt`](data/signatures.txt) and
 are compiled into the binary; `-s FILE` uses your own.
 
 The spike detector works on log(1 + bytes per second), so going from 1 MB/s
 to 20 MB/s counts the same as going from 10 kB/s to 200 kB/s. "Usual" is the
-median of the last five minutes and the spread is the median absolute
-deviation, so quiet seconds and short bursts barely move the baseline. It
-alerts when traffic stays 4 spreads above the median, and above 1 MB/s, for 3
-seconds in a row.
+median of the last five minutes, and the spread is 1.4826 times the median
+absolute deviation (an estimate of the standard deviation that outliers
+barely move), with a floor of 0.25, so quiet seconds and short bursts don't
+skew either. After a minute of warming up, it alerts when traffic stays more
+than 4 spreads above the median, and above 1 MB/s, for 3 seconds in a row; at
+most once every five minutes per direction.
 
 Thresholds can be changed with `--scan-ports`, `--flood-rate` and
 `--spike-sigma`.
@@ -122,8 +125,13 @@ Run `packetmonitor --help` for everything else.
 - **The engine** keeps a table of flows with per-direction byte counts,
   rates, TCP handshake state, the stream positions used for matching, and the
   start of each TLS handshake until its server name has arrived. Its clock is
-  the packets' timestamps, not the wall clock, so a replay gives exactly the
-  results seen live. The tests rely on that.
+  the packets' timestamps, not the wall clock, so replaying a recording
+  reproduces what was seen live, and a file gives the same results on every
+  run, which the tests rely on. If the clock jumps (a correction, or a
+  corrupt timestamp in a file), it starts again from the new time.
+- **Under load** it degrades rather than stops: when the flow table is full,
+  half-open and idle connections make way for new ones, so a SYN flood can't
+  switch off inspection of everything else.
 - **App names** come from `/proc/net/*` and `/proc/<pid>/fd` on Linux, and
   from `libproc` on macOS (the API `lsof` uses), refreshed on a background
   thread every two seconds or as soon as a new connection is seen.
@@ -136,12 +144,16 @@ Run `packetmonitor --help` for everything else.
 
 | | Speed |
 | --- | --- |
-| Whole pipeline (sample capture × 20, 9.4 million packets) | 5.5 million packets/s |
-| Signature matching, Aho–Corasick | 456 MB/s |
-| Signature matching, one search per rule (as in version 1) | 127 MB/s |
+| Whole pipeline (sample capture × 20, 9.4 million packets) | 4.5–5.5 million packets/s |
+| Signature matching, Aho–Corasick | 450–500 MB/s |
+| Signature matching, one search per rule (as in version 1) | 125–130 MB/s |
 
-On a 2.1 GHz Intel Xeon; the pipeline uses two threads, the matcher one.
-Reproduce with
+On a 2.1 GHz Intel Xeon; the pipeline uses two threads, the matcher one. Most
+packets in the sample are bulk data cut to their headers (as `tcpdump -s 96`
+would capture them), so the pipeline figure measures decoding, flow tracking
+and detection; payload matching is measured on its own in the next two rows,
+over 256 MB of packets that are three-quarters random bytes, like encrypted
+traffic, and a quarter HTTP text. Reproduce with
 `packetmonitor --read build/sample.pcap --bench --repeat 20` and
 `build/pm-bench-signatures`. Both run in CI, on Linux and macOS.
 
@@ -159,7 +171,7 @@ against the original bytes.
 ctest --test-dir build --output-on-failure
 ```
 
-72 tests, run in CI on Linux and macOS, with and without AddressSanitizer and
+78 tests, run in CI on Linux and macOS, with and without AddressSanitizer and
 UndefinedBehaviorSanitizer:
 
 - the decoder, DNS and TLS parsers against hand-built packets, every
@@ -170,6 +182,8 @@ UndefinedBehaviorSanitizer:
 - the ring with a producer and a consumer thread passing 300,000 records;
 - each detector on synthetic traffic, including cases that must not alert;
 - the dashboard drawn at sizes from 20×5 to 250×80;
+- the engine on crafted connections: split ClientHellos, retransmissions,
+  gaps, reused ports, clock jumps and a full flow table;
 - the whole sample capture end to end: all five incidents found, once each,
   in order, and the same on every run.
 

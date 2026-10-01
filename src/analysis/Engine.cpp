@@ -19,6 +19,7 @@ constexpr size_t kMaxDnsNames = 65536;
 constexpr size_t kMaxHelloBytes = 16384;
 constexpr size_t kMaxAlertsKept = 1000;
 constexpr int kOwnerTries = 6;
+constexpr size_t kMaxHosts = 5000;
 
 enum : uint8_t {
     kSynSeen = 1,
@@ -81,6 +82,7 @@ struct Engine::Flow {
     std::string app;
     uint8_t ownerTries = 0;
     bool ownerDone = false;
+    bool transit = false;  // between two other hosts
 
     int64_t first = 0, last = 0;
     uint64_t bytes[2] = {0, 0};  // [0] a to b, [1] b to a
@@ -93,7 +95,6 @@ struct Engine::Flow {
     uint32_t nextSeq[2] = {0, 0};
     SignatureSet::Stream sig[2];
     std::string helloBuf;
-    std::vector<uint32_t> matched;
 
     int clientDir() const { return aClient ? 0 : 1; }
     int localOutDir() const { return aLocal ? 0 : 1; }  // direction of traffic leaving this machine
@@ -164,6 +165,8 @@ void Engine::process(const PacketRecordHeader& h, const uint8_t* data) {
         synFlood_.onAttempt(p.tsUsec, p.dst, p.dport);
     }
 
+    if (p.hasL4 && p.payloadLen > 0 && p.sport == 53 && (p.proto == kProtoUdp || p.proto == kProtoTcp)) handleDns(p);
+
     bool srcIsA = false;
     FlowKey key = FlowKey::of(p, srcIsA);
     Flow* f = p.fragment ? nullptr : flowFor(p, key, srcIsA);
@@ -181,22 +184,59 @@ void Engine::process(const PacketRecordHeader& h, const uint8_t* data) {
     account(p.wireLen, dir == f->localOutDir());
 
     if (p.proto == kProtoTcp && p.hasL4) handleTcp(*f, p, dir);
-    if (p.proto == kProtoUdp && p.hasL4 && (p.sport == 53 || p.dport == 53)) handleDns(p);
-    if (p.proto == kProtoTcp && p.hasL4 && p.sport == 53 && p.payloadLen > 0) handleDns(p);
     if (p.payloadLen > 0 || (p.proto == kProtoTcp && p.payloadTotal > 0)) handlePayload(*f, p, dir);
     secService_[int(f->service)] += p.wireLen;
 }
 
 Engine::Flow* Engine::flowFor(const PacketView& p, const FlowKey& key, bool srcIsA) {
     auto it = flows_.find(key);
-    if (it != flows_.end()) return it->second.get();
-    if (flows_.size() >= cfg_.maxFlows) return nullptr;
+    if (it != flows_.end()) {
+        Flow& f = *it->second;
+        // A new SYN on a closed connection, or with a different initial
+        // sequence number, is a new connection reusing the same ports.
+        const int dir = srcIsA ? 0 : 1;
+        const bool syn = p.proto == kProtoTcp && p.hasL4 && (p.tcpFlags & kTcpSyn) && !(p.tcpFlags & kTcpAck);
+        if (syn && ((f.tcp & (kReset | kFinA | kFinB)) || (f.seqKnown[dir] && f.nextSeq[dir] != p.seq + 1))) {
+            Flow fresh;
+            fresh.key = key;
+            for (int d = 0; d < 2; d++) {  // keep the counters, which belong to the address pair
+                fresh.bytes[d] = f.bytes[d];
+                fresh.tickBytes[d] = f.tickBytes[d];
+                fresh.rate[d] = f.rate[d];
+            }
+            const int64_t first = f.first;
+            f = std::move(fresh);
+            initFlow(f, p, srcIsA);
+            f.first = first;
+        }
+        return &f;
+    }
+    if (flows_.size() >= cfg_.maxFlows) makeRoom();
     auto f = std::make_unique<Flow>();
     f->key = key;
     Flow* raw = f.get();
     flows_.emplace(key, std::move(f));
     initFlow(*raw, p, srcIsA);
     return raw;
+}
+
+void Engine::makeRoom() {
+    // Rather than stop tracking new connections when the table is full (which
+    // a flood of spoofed SYNs could force), drop a tenth of it: half-open
+    // connections first, then the longest idle.
+    std::vector<std::pair<int64_t, const FlowKey*>> order;
+    order.reserve(flows_.size());
+    for (const auto& [k, f] : flows_) {
+        const bool halfOpen = k.proto == kProtoTcp && !(f->tcp & kEstablished);
+        order.emplace_back(halfOpen ? f->last - (int64_t(1) << 50) : f->last, &k);
+    }
+    const size_t drop = std::max<size_t>(1, flows_.size() / 10);
+    std::nth_element(order.begin(), order.begin() + long(drop - 1), order.end());
+    std::vector<FlowKey> victims;
+    victims.reserve(drop);
+    for (size_t i = 0; i < drop; i++) victims.push_back(*order[i].second);
+    for (const auto& k : victims) flows_.erase(k);
+    evicted_ += drop;
 }
 
 void Engine::initFlow(Flow& f, const PacketView& p, bool srcIsA) {
@@ -217,8 +257,19 @@ void Engine::initFlow(Flow& f, const PacketView& p, bool srcIsA) {
     }
     f.aClient = clientIsSrc == srcIsA;
 
-    // Which end is this machine: the local address, or else the client.
-    bool localIsSrc = srcLocal != dstLocal ? srcLocal : clientIsSrc;
+    // Which end is this machine: the local address. With both local
+    // (loopback), the client. With neither, this machine is at most a
+    // receiver: of multicast or broadcast, or of other hosts' traffic seen in
+    // promiscuous mode, which isn't ours to look up.
+    bool localIsSrc;
+    if (srcLocal != dstLocal) {
+        localIsSrc = srcLocal;
+    } else if (srcLocal) {
+        localIsSrc = clientIsSrc;
+    } else {
+        localIsSrc = false;
+        f.transit = !p.dst.isMulticastOrBroadcast();
+    }
     f.aLocal = localIsSrc == srcIsA;
 
     f.service = classifyPort(p.proto, p.hasL4 ? f.serverPort() : 0);
@@ -288,11 +339,7 @@ void Engine::handlePayload(Flow& f, const PacketView& p, int dir) {
     if (sigs_ && sigs_->size() && len > 0) {
         SignatureSet::Stream fresh;
         SignatureSet::Stream& st = p.proto == kProtoTcp ? f.sig[dir] : fresh;
-        sigs_->scan(st, data, len, [&](uint32_t id) {
-            if (std::find(f.matched.begin(), f.matched.end(), id) != f.matched.end()) return;
-            f.matched.push_back(id);
-            signatureAlert(f, p, id);
-        });
+        sigs_->scan(st, data, len, [&](uint32_t id) { signatureAlert(f, p, id); });
     }
     // Bytes we didn't capture break the stream.
     if (p.proto == kProtoTcp && p.payloadTruncated()) f.sig[dir] = {};
@@ -306,6 +353,12 @@ void Engine::inspectClientStart(Flow& f, const uint8_t* data, size_t len, bool g
     }
     if (f.hello == kHelloWaiting) {
         if (len == 0) return;
+        if (len < 6 && data[0] == 0x16) {  // a record header split off on its own
+            f.service = Service::Tls;
+            f.helloBuf.assign(reinterpret_cast<const char*>(data), len);
+            f.hello = kHelloBuffering;
+            return;
+        }
         if (!looksLikeTlsHandshake(data, len)) {
             f.hello = kHelloDone;
             if (isHttpRequest(data, len)) {
@@ -334,6 +387,7 @@ void Engine::inspectClientStart(Flow& f, const uint8_t* data, size_t len, bool g
     std::string host;
     SniResult r = extractSni(reinterpret_cast<const uint8_t*>(f.helloBuf.data()), f.helloBuf.size(), host);
     if (r == SniResult::Found) setHost(f, host, kHostSni);
+    if (r == SniResult::NotTls) f.service = classifyPort(f.key.proto, f.serverPort());
     if (r != SniResult::NeedMore || f.helloBuf.size() > kMaxHelloBytes) {
         f.hello = kHelloDone;
         std::string().swap(f.helloBuf);
@@ -372,7 +426,7 @@ void Engine::setHost(Flow& f, std::string host, uint8_t source) {
 
 void Engine::tryOwner(Flow& f) {
     if (f.ownerDone) return;
-    if (!owners_ || (f.key.proto != kProtoTcp && f.key.proto != kProtoUdp)) {
+    if (!owners_ || f.transit || (f.key.proto != kProtoTcp && f.key.proto != kProtoUdp)) {
         f.ownerDone = true;
         return;
     }
@@ -432,6 +486,15 @@ void Engine::advanceTo(int64_t now) {
     if (nextTick_ == 0) {
         startUsec_ = now;
         nextTick_ = (now / kSec + 1) * kSec;
+        return;
+    }
+    if (now < nextTick_ - 10 * kSec) {
+        // Time went backwards (the clock was corrected, or a bad timestamp
+        // pushed us ahead): start again from now rather than wait.
+        nextTick_ = (now / kSec + 1) * kSec;
+        nowUsec_ = now;
+        portScan_.reset();
+        synFlood_.reset();
         return;
     }
     int caughtUp = 0;
@@ -515,9 +578,19 @@ void Engine::tick(int64_t t) {
         else limit = 120 * kSec;
         it = idle > limit ? flows_.erase(it) : std::next(it);
     }
-    if (hosts_.size() > 20000) {
-        for (auto it = hosts_.begin(); it != hosts_.end();) {
-            it = t - it->second.lastActive > 600 * kSec ? hosts_.erase(it) : std::next(it);
+    if (hosts_.size() > kMaxHosts) {
+        // Many hosts (a spoofed flood, a scan of the internet): forget the
+        // quiet ones, oldest first.
+        std::vector<std::pair<int64_t, const std::string*>> quiet;
+        for (const auto& [name, g] : hosts_) {
+            if (g.flows == 0) quiet.emplace_back(g.lastActive, &name);
+        }
+        size_t drop = std::min(quiet.size(), hosts_.size() - kMaxHosts / 2);
+        if (drop) {
+            std::nth_element(quiet.begin(), quiet.begin() + long(drop - 1), quiet.end());
+            std::vector<std::string> names;
+            for (size_t i = 0; i < drop; i++) names.push_back(*quiet[i].second);
+            for (const auto& n : names) hosts_.erase(n);
         }
     }
 
@@ -590,8 +663,21 @@ void Engine::publish(int64_t t) {
     }
 
     auto groups = [&](const std::unordered_map<std::string, Group>& src, std::vector<GroupRow>& dst, size_t max) {
+        using Entry = std::pair<const std::string*, const Group*>;
+        std::vector<Entry> order;
         for (const auto& [name, g] : src) {
-            if (g.totalIn + g.totalOut == 0) continue;
+            if (g.totalIn + g.totalOut) order.emplace_back(&name, &g);
+        }
+        auto first = [](const Entry& a, const Entry& b) {
+            double ra = a.second->rateIn + a.second->rateOut, rb = b.second->rateIn + b.second->rateOut;
+            if (ra != rb) return ra > rb;
+            return a.second->totalIn + a.second->totalOut > b.second->totalIn + b.second->totalOut;
+        };
+        const size_t keep = std::min(order.size(), max);
+        std::partial_sort(order.begin(), order.begin() + long(keep), order.end(), first);
+        for (size_t i = 0; i < keep; i++) {
+            const std::string& name = *order[i].first;
+            const Group& g = *order[i].second;
             GroupRow r;
             r.name = name;
             r.detail = g.detail;
@@ -603,12 +689,6 @@ void Engine::publish(int64_t t) {
             r.totalOut = g.totalOut;
             dst.push_back(std::move(r));
         }
-        std::sort(dst.begin(), dst.end(), [](const GroupRow& a, const GroupRow& b) {
-            double ra = a.rateIn + a.rateOut, rb = b.rateIn + b.rateOut;
-            if (ra != rb) return ra > rb;
-            return a.totalIn + a.totalOut > b.totalIn + b.totalOut;
-        });
-        if (dst.size() > max) dst.resize(max);
     };
     groups(apps_, s->apps, 100);
     groups(hosts_, s->hosts, 200);

@@ -53,7 +53,7 @@ std::vector<InterfaceInfo> Capture::interfaces(std::string& error) {
                 i.addresses.push_back(IpAddr::v4(reinterpret_cast<const uint8_t*>(&sin->sin_addr)));
             } else if (a->addr->sa_family == AF_INET6) {
                 auto* sin6 = reinterpret_cast<const sockaddr_in6*>(a->addr);
-                i.addresses.push_back(IpAddr::v6(reinterpret_cast<const uint8_t*>(&sin6->sin6_addr)));
+                i.addresses.push_back(IpAddr::v6(reinterpret_cast<const uint8_t*>(&sin6->sin6_addr)).withoutScope());
             }
         }
         out.push_back(std::move(i));
@@ -192,12 +192,18 @@ void onPacket(u_char* user, const pcap_pkthdr* h, const u_char* bytes) {
 bool Capture::run(const Sink& sink, std::string& error) {
     if (live_) {
         DispatchContext ctx{&sink, dumper_};
+        auto lastStats = std::chrono::steady_clock::now();
         while (!stop_.load(std::memory_order_relaxed)) {
             int n = pcap_dispatch(handle_, -1, onPacket, reinterpret_cast<u_char*>(&ctx));
             if (n == PCAP_ERROR_BREAK) break;
             if (n < 0) {
                 error = pcap_geterr(handle_);
                 return false;
+            }
+            auto now = std::chrono::steady_clock::now();
+            if (now - lastStats > std::chrono::milliseconds(250)) {
+                lastStats = now;
+                readStats();
             }
         }
         if (dumper_) pcap_dump_flush(dumper_);
@@ -246,15 +252,16 @@ int64_t Capture::clockUsec() const {
     return 0;
 }
 
-CaptureStats Capture::stats() const {
-    CaptureStats s;
-    if (!handle_ || !live_) return s;
+void Capture::readStats() {
     pcap_stat st{};
     if (pcap_stats(handle_, &st) == 0) {
-        s.received = st.ps_recv;
-        s.dropped = st.ps_drop + st.ps_ifdrop;
+        received_.store(st.ps_recv, std::memory_order_relaxed);
+        dropped_.store(uint64_t(st.ps_drop) + st.ps_ifdrop, std::memory_order_relaxed);
     }
-    return s;
+}
+
+CaptureStats Capture::stats() const {
+    return CaptureStats{received_.load(std::memory_order_relaxed), dropped_.load(std::memory_order_relaxed)};
 }
 
 }  // namespace pm

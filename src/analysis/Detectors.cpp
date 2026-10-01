@@ -39,7 +39,14 @@ void PortScanDetector::onAttempt(int64_t ts, const IpAddr& src, const IpAddr& ds
     PairKey key{src, dst};
     auto it = pairs_.find(key);
     if (it == pairs_.end()) {
-        if (pairs_.size() >= kMaxTracked) return;
+        if (pairs_.size() >= kMaxTracked) {
+            // Full, probably of spoofed one-off attempts: drop the pairs that
+            // have tried only a port or two, so a real scanner is still seen.
+            for (auto p = pairs_.begin(); p != pairs_.end();) {
+                p = p->second.lastTry.size() <= 2 ? pairs_.erase(p) : std::next(p);
+            }
+            if (pairs_.size() >= kMaxTracked) return;
+        }
         it = pairs_.emplace(key, State{}).first;
     }
     auto& ports = it->second.lastTry;
@@ -126,7 +133,7 @@ void SynFloodDetector::tick(int64_t now, AlertList& out) {
             completed += s.completed;
         }
         const double perSec = double(attempts) / cfg_.floodWindowSec;
-        if (perSec >= cfg_.floodSynPerSec && double(completed) <= cfg_.floodMaxCompleted * double(attempts) &&
+        if (perSec >= cfg_.floodSynPerSec && double(completed) < cfg_.floodMaxCompleted * double(attempts) &&
             now - st.lastAlert >= int64_t(cfg_.cooldownSec) * kSec) {
             st.lastAlert = now;
             Alert a;
